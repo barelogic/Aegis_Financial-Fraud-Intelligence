@@ -34,7 +34,10 @@ def evaluate(scored_txns: pd.DataFrame, scored_accs: pd.DataFrame,
             len(set(top_k) & {str(a) for a in fraud_accts}) / max(len(fraud_accts), 1), 4)
     gt_rings = set()
     if gt_txn is not None and "ring_id" in gt_txn.columns:
-        gt_rings = {r for r in gt_txn["ring_id"].unique() if r}
+        # NB: read_csv parses empty ring_id as NaN, and bool(nan) is True,
+        # so filter NaN explicitly or phantom rings inflate the count.
+        gt_rings = {r for r in gt_txn["ring_id"].unique()
+                    if pd.notna(r) and r}
     metrics["n_rings_found"] = len(rings or [])
     metrics["n_rings_truth"] = len(gt_rings)
     alert_pct = 100 * (scored_txns["txn_risk_score"] >= th.get("high", 65)).mean()

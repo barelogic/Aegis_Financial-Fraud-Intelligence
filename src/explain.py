@@ -139,6 +139,44 @@ def shap_top_features(model, X: pd.DataFrame, top_k: int = 3,
                 for _ in range(len(X))]
 
 
+def _shap_feature_is_abnormal(feature: str, feat_row: pd.Series) -> bool:
+    """True only if the feature's value actually looks anomalous.
+
+    SHAP ranks features by model impact, not by guilt: on a benign row the
+    top features still have innocent values (fan-in 0, no burst, ...).
+    Verbalizing those produces nonsense like "received money from 0
+    accounts". Gate each feature on its rule threshold instead.
+    """
+    def _v(key: str, default: float = 0.0) -> float:
+        try:
+            return float(feat_row.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    if feature in ("amount_zscore", "amount_ratio"):
+        return _v("amount_ratio") >= 2.0 or abs(_v("amount_zscore")) >= 2.0
+    if feature in ("vel_cnt_1h", "vel_amt_1h"):
+        return _v("vel_cnt_1h") >= 2
+    if feature in ("vel_cnt_24h", "vel_amt_24h"):
+        return _v("vel_cnt_24h") >= 4
+    if feature in ("is_new_device", "is_new_city", "is_new_mcc",
+                   "is_new_destination", "is_transfer_out"):
+        return _v(feature) == 1
+    if feature == "hour_unusualness":
+        return _v(feature) >= 0.9
+    if feature == "account_age_days":
+        return _v(feature) <= 30
+    if feature == "burst_transfer_frac":
+        return _v(feature) >= 0.5 and _v("is_transfer_out") == 1
+    if feature == "dest_fanin":
+        return _v(feature) >= 3
+    if feature == "device_sharing":
+        return _v(feature) >= 2
+    if feature == "item_rarity":
+        return _v(feature) >= 0.9
+    return True
+
+
 def explain_transaction(feat_row: pd.Series, txn: pd.Series,
                         shap_feats: list[tuple[str, float]] | None,
                         score: float, history_months: int = 6) -> list[str]:
@@ -151,10 +189,10 @@ def explain_transaction(feat_row: pd.Series, txn: pd.Series,
             seen.add(s)
             reasons.append(s)
 
-    # 1. SHAP top-3 mapped to sentences.
+    # 1. SHAP top-3 mapped to sentences (abnormal values only).
     for feat, _ in (shap_feats or [])[:3]:
-        # Skip "normal" indicators for low-risk rows to keep reasons honest.
-        _add(feature_sentence(feat, feat_row, txn))
+        if _shap_feature_is_abnormal(feat, feat_row):
+            _add(feature_sentence(feat, feat_row, txn))
     # 2. Rule evidence.
     for s in rule_evidence(feat_row, txn):
         _add(s)

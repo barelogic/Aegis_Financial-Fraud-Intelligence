@@ -8,7 +8,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from features import compute_features
-from score_accounts import score_accounts
+from score_accounts import apply_ring_bump, score_accounts
 from score_transactions import score_transactions
 
 CFG = {"seed": 42, "risk_thresholds": {"medium": 40, "high": 65, "critical": 85},
@@ -54,3 +54,52 @@ def test_scores_bounded_and_explained():
     acc_scored = score_accounts(scored, feats, accs, None, CFG)
     assert acc_scored["account_risk_score"].between(0, 100).all()
     assert (acc_scored["account_reasons"].str.strip() != "").all()
+
+
+def _scored_frame(rows: list[dict]) -> pd.DataFrame:
+    base = {"timestamp": datetime(2025, 1, 2), "currency": "INR",
+            "merchant_id": "m1", "merchant_category": "grocery",
+            "item_id": "item_1", "item_category": "grocery", "channel": "POS",
+            "device_id": "d0", "ip_address": "10.0.0.1", "city": "Mumbai",
+            "country": "India", "txn_type": "transfer", "txn_risk_band": "high",
+            "txn_reasons": "x", "txn_action": "review"}
+    return pd.DataFrame([{**base, **r} for r in rows])
+
+
+def test_pure_receiver_sink_is_scored_from_incoming_flow():
+    scored = _scored_frame([
+        {"txn_id": f"s{i}", "account_id": f"sender{i}", "amount": 50000,
+         "dest_account_id": "sink1", "txn_risk_score": 70.0 + 5 * i}
+        for i in range(4)])
+    accs = pd.DataFrame([
+        {"account_id": f"sender{i}", "created_at": datetime(2025, 1, 1),
+         "home_city": "Mumbai", "home_country": "India", "segment": "salaried"}
+        for i in range(4)] + [
+        {"account_id": "sink1", "created_at": datetime(2025, 1, 1),
+         "home_city": "Mumbai", "home_country": "India", "segment": "salaried"}])
+    out = score_accounts(scored, None, accs, None, CFG)
+    row = out[out["account_id"] == "sink1"].iloc[0]
+    assert row["account_risk_score"] >= 65, row["account_risk_score"]
+    assert "4 distinct" in row["account_reasons"]
+    # ... and attributed to the senders' ring when >=3 senders are members.
+    rings = [{"ring_id": "ring_9", "accounts": [f"sender{i}" for i in range(4)],
+              "size": 4, "ring_risk_score": 80.0,
+              "link_types_found": ["shared_destination"],
+              "evidence": {}, "pattern_summary": "p",
+              "recommended_actions": []}]
+    out2 = apply_ring_bump(out, rings, CFG, scored)
+    row2 = out2[out2["account_id"] == "sink1"].iloc[0]
+    assert row2["ring_id"] == "ring_9"
+    assert "Collector" in row2["account_reasons"]
+
+
+def test_low_risk_reasons_have_no_zero_value_claims():
+    txns, accs = _toy()
+    feats = compute_features(txns, accs, CFG)
+    scored = score_transactions(feats, txns, None, CFG)
+    low = scored[scored["txn_risk_score"] < 40]
+    assert len(low) > 0
+    for reasons in low["txn_reasons"]:
+        assert "0 different accounts" not in reasons, reasons
+        assert "Rs 0" not in reasons, reasons
+        assert "equals 0%" not in reasons, reasons

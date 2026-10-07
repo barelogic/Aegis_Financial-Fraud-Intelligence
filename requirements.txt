@@ -1,13 +1,21 @@
-# Pinned versions tested to work together on Python 3.10+ (CPU only).
-pandas==2.2.2
-numpy==1.26.4
-scikit-learn==1.5.0
-xgboost==2.0.3
-shap==0.46.0
+# Version floors chosen so every compiled package ships a prebuilt wheel
+# for CPython 3.10 through 3.14 (CPU only). Let pip resolve the newest
+# versions within these bounds.
+#
+# WARNING: do not pin pandas==2.2.2 / numpy==1.26.4 / scikit-learn==1.5.0 /
+# matplotlib==3.8.4 / shap==0.46.0 / xgboost==2.0.3 on Python 3.13+:
+# those releases predate 3.13, publish no cp313 wheels, and pip falls back
+# to building pandas from source, which fails on modern GCC
+# (CYTHON_UNUSED / [[maybe_unused]] error in window/aggregations).
+pandas>=2.3
+numpy>=2.2
+scikit-learn>=1.6
+xgboost>=2.1
+shap>=0.47
 networkx==3.3
 python-louvain==0.16
 pyvis==0.3.2
-matplotlib==3.8.4
+matplotlib>=3.10
 pytest==8.3.2
-pyyaml==6.0.1
+pyyaml>=6.0.2
 faker==25.0.1

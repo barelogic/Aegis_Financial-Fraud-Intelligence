@@ -3,8 +3,12 @@
     base = w_max * max_txn_score + w_top3 * mean(top-3 txn scores)
     final = min(99, base + ring_bump) for ring members, with a reason sentence
     like "Member of ring_1 with 9 other accounts".
+    Pure receivers (collector/sink accounts with no outgoing transactions)
+    are scored from incoming flow: fan-in plus senders' risk.
 """
 from __future__ import annotations
+
+from collections import Counter
 
 import numpy as np
 import pandas as pd
@@ -96,13 +100,42 @@ def score_accounts(scored_txns: pd.DataFrame, features: pd.DataFrame | None,
         lambda s: _band(float(s), th))
     agg["account_action"] = agg["account_risk_band"].map(_action)
 
-    # Include accounts with zero transactions (score 0, benign reason).
+    # Accounts with zero OUTGOING transactions: most simply never transact
+    # (score 0), but pure receivers of transfers (collector/sink accounts)
+    # are scored from incoming flow: fan-in plus the senders' risk.
+    recv = scored_txns[(scored_txns["dest_account_id"].notna())
+                       & (scored_txns["dest_account_id"] != "")]
+    incoming = (recv.groupby("dest_account_id").agg(
+        fanin=("account_id", "nunique"), n_in=("txn_id", "count"),
+        total_in=("amount", "sum"),
+        max_sender_score=("txn_risk_score", "max")) if len(recv)
+        else pd.DataFrame())
+    recv_idx = set(incoming.index) if len(incoming) else set()
     all_accts = set(accounts["account_id"].astype(str))
     missing = all_accts - set(agg["account_id"].astype(str))
-    extra = [{"account_id": a, "account_risk_score": 0.0, "ring_id": "",
-              "account_reasons": "No transactions observed for this account",
-              "account_risk_band": "low", "account_action": "monitor"}
-             for a in missing]
+    extra = []
+    for a in missing:
+        if a in recv_idx:
+            row = incoming.loc[a]
+            fanin = int(row["fanin"])
+            score = round(min(90.0, 30 + 10 * min(fanin, 5)
+                              + 0.3 * float(row["max_sender_score"])), 1)
+            reason = (f"Received Rs {float(row['total_in']):,.0f} in "
+                      f"{int(row['n_in'])} transfer(s) from {fanin} distinct "
+                      f"account(s); highest-risk sender scored "
+                      f"{float(row['max_sender_score']):.0f}/100")
+            band = _band(score, th)
+            extra.append({"account_id": a, "account_risk_score": score,
+                          "ring_id": "", "account_reasons": reason,
+                          "account_risk_band": band,
+                          "account_action": _action(band)})
+        else:
+            extra.append({"account_id": a, "account_risk_score": 0.0,
+                          "ring_id": "",
+                          "account_reasons": "No transactions observed "
+                                             "for this account",
+                          "account_risk_band": "low",
+                          "account_action": "monitor"})
     if extra:
         agg = pd.concat([agg, pd.DataFrame(extra)], ignore_index=True)
 
@@ -115,18 +148,47 @@ def score_accounts(scored_txns: pd.DataFrame, features: pd.DataFrame | None,
 
 
 def apply_ring_bump(accounts_df: pd.DataFrame, rings: list[dict],
-                    config: dict) -> pd.DataFrame:
+                    config: dict,
+                    scored_txns: pd.DataFrame | None = None) -> pd.DataFrame:
     """Add ring-membership bump + reason sentence (called after detect_rings).
 
     Adds a sentence like "Member of ring_1 with 9 other accounts
     (shared devices, shared destination)".
+
+    Pure-receiver accounts (sinks) never appear as graph members because
+    they have no outgoing transactions. When scored_txns is provided they
+    are attributed to a ring if >=3 of their distinct senders belong to it.
     """
     bump = float(config.get("account_scoring", {}).get("ring_bump", 20))
     th = config.get("risk_thresholds", {})
+    gate = float(th.get("high", 65))
     member_to_ring: dict[str, dict] = {}
     for r in rings:
+        # Only high-risk rings push risk back onto members; low-evidence
+        # groups must not inflate hundreds of innocent accounts.
+        if float(r.get("ring_risk_score", 0)) < gate:
+            continue
         for a in r.get("accounts", []):
             member_to_ring[str(a)] = r
+    attributed: set[str] = set()
+    if scored_txns is not None:
+        recv = scored_txns[(scored_txns["dest_account_id"].notna())
+                           & (scored_txns["dest_account_id"] != "")]
+        if len(recv):
+            senders_by_dest = (recv.groupby("dest_account_id")["account_id"]
+                               .apply(lambda s: {str(x) for x in set(s)}))
+            ring_of = {a: r["ring_id"] for a, r in member_to_ring.items()}
+            acct_set = set(accounts_df["account_id"].astype(str))
+            by_id = {r["ring_id"]: r for r in rings}
+            for dest, senders in senders_by_dest.items():
+                if str(dest) in member_to_ring or str(dest) not in acct_set:
+                    continue
+                votes = Counter(ring_of[s] for s in senders if s in ring_of)
+                if votes:
+                    top_ring, top_n = votes.most_common(1)[0]
+                    if top_n >= 3 and top_ring in by_id:
+                        member_to_ring[str(dest)] = by_id[top_ring]
+                        attributed.add(str(dest))
     out = accounts_df.copy()
     for i, (_, row) in enumerate(out.iterrows()):
         ring = member_to_ring.get(str(row["account_id"]))
@@ -137,8 +199,12 @@ def apply_ring_bump(accounts_df: pd.DataFrame, rings: list[dict],
             out.loc[out.index[i], "account_risk_score"] = min(
                 99.0, float(row["account_risk_score"]) + bump)
             prev = str(row.get("account_reasons", ""))
-            extra = (f"Member of {ring['ring_id']} with {others} other "
-                     f"account(s) ({links})")
+            if str(row["account_id"]) in attributed:
+                extra = (f"Collector for {ring['ring_id']}: receives funds "
+                         f"from its member accounts ({links})")
+            else:
+                extra = (f"Member of {ring['ring_id']} with {others} other "
+                         f"account(s) ({links})")
             out.loc[out.index[i], "account_reasons"] = (
                 f"{prev}; {extra}" if prev else extra)
     out["account_risk_band"] = out["account_risk_score"].map(

@@ -127,7 +127,7 @@ def main() -> None:
     rings = detect_rings(scored_txns, feats, txns, cfg)
     save_ring_outputs(rings, scored_txns, txns, str(OUT))
     if rings:
-        scored_accs = apply_ring_bump(scored_accs, rings, cfg)
+        scored_accs = apply_ring_bump(scored_accs, rings, cfg, scored_txns)
         scored_accs.to_csv(OUT / "accounts_scored.csv", index=False)
         scored_txns = apply_ring_bump_to_transactions(scored_txns, rings, cfg)
         scored_txns.to_csv(OUT / "transactions_scored.csv", index=False)

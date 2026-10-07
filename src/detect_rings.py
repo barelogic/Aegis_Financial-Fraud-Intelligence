@@ -20,8 +20,46 @@ def _seq_signature(transactions: pd.DataFrame, acct: str) -> tuple:
     return tuple(sub["merchant_category"].tolist()[:8])
 
 
+def _item_order_pairs(transactions: pd.DataFrame, min_shared: int = 2,
+                      max_buyers: int = 12) -> set[frozenset]:
+    """Account pairs that bought >=min_shared uncommon items in the same order.
+
+    'Uncommon' = bought by 2..max_buyers distinct accounts. Bulk/placeholder
+    items (TRANSFER_OUT, popular goods) and one-off coincidences are excluded:
+    a single shared item is never enough, which protects hard negatives like
+    the laptop buyers (1 shared item) and supplier accounts (1 shared item).
+    """
+    tx = transactions[transactions["item_id"].notna()
+                      & (transactions["item_id"] != "")]
+    buyers = tx.groupby("item_id")["account_id"].apply(lambda s: sorted(set(s)))
+    buyers = buyers[buyers.apply(len).between(2, max_buyers)]
+    if buyers.empty:
+        return set()
+    # Chronological item list per account.
+    ordered = (tx.sort_values("timestamp").groupby("account_id")["item_id"]
+                 .apply(list))
+    pos: dict[str, dict] = {a: {it: i for i, it in enumerate(seq)}
+                            for a, seq in ordered.items()}
+    shared: dict[frozenset, list] = {}
+    for _item, accts in buyers.items():
+        for u, v in itertools.combinations(accts, 2):
+            shared.setdefault(frozenset((u, v)), []).append(_item)
+    out: set[frozenset] = set()
+    for pair, items in shared.items():
+        if len(items) < min_shared:
+            continue
+        u, v = tuple(pair)
+        pu, pv = pos.get(u, {}), pos.get(v, {})
+        # Same relative order in both purchase histories?
+        if (sorted(items, key=lambda it: pu.get(it, 10 ** 9))
+                == sorted(items, key=lambda it: pv.get(it, 10 ** 9))):
+            out.add(pair)
+    return out
+
+
 def build_link_graph(scored_txns: pd.DataFrame, transactions: pd.DataFrame,
-                     config: dict):
+                     config: dict,
+                     item_order_pairs: set[frozenset] | None = None):
     """Build a weighted account graph from shared-entity links."""
     import networkx as nx
     w = config.get("link_weights", {})
@@ -31,7 +69,12 @@ def build_link_graph(scored_txns: pd.DataFrame, transactions: pd.DataFrame,
 
     def _add_link(col: str, weight: float, min_share: int = 2) -> None:
         groups = transactions.groupby(col)["account_id"].apply(set)
-        for _, users in groups.items():
+        for key, users in groups.items():
+            # Never link on empty/NaN keys: every purchase-only account
+            # shares dest "" / NaN, which would hairball the whole graph.
+            if key is None or key == "" or (
+                    isinstance(key, float) and pd.isna(key)):
+                continue
             users = {u for u in users if u == u and u != ""}
             if len(users) < min_share:
                 continue
@@ -55,6 +98,16 @@ def build_link_graph(scored_txns: pd.DataFrame, transactions: pd.DataFrame,
                 prev = G[u][v]["weight"] if G.has_edge(u, v) else 0.0
                 G.add_edge(u, v,
                            weight=prev + float(w.get("purchase_sequence", 0.8)))
+    # Same-order rare-item purchases (coordinated buying trips): pairs that
+    # bought >=2 uncommon items in the same chronological order.
+    if item_order_pairs is None:
+        item_order_pairs = _item_order_pairs(transactions)
+    for pair in item_order_pairs:
+        u, v = sorted(tuple(pair))
+        if G.has_node(u) and G.has_node(v):
+            prev = G[u][v]["weight"] if G.has_edge(u, v) else 0.0
+            G.add_edge(u, v,
+                       weight=prev + float(w.get("purchase_sequence", 0.8)))
     # Drop trivial single-weak-link edges to limit false rings.
     weak = [(u, v) for u, v, d in G.edges(data=True) if d["weight"] < 1.5]
     G.remove_edges_from(weak)
@@ -84,20 +137,30 @@ def detect_rings(scored_txns: pd.DataFrame, features: pd.DataFrame,
                  transactions: pd.DataFrame, config: dict) -> list[dict]:
     """Detect fraud rings; return rings.json-style list of dicts."""
     seed = int(config.get("seed", 42))
-    G = build_link_graph(scored_txns, transactions, config)
+    min_fanin = int(config.get("min_ring_fanin", 4))
+    # Item-order pairs are computed on GLOBAL buyer pools (an item that is
+    # rare globally is meaningful; rarity inside one community is not).
+    io_pairs = _item_order_pairs(transactions)
+    G = build_link_graph(scored_txns, transactions, config,
+                         item_order_pairs=io_pairs)
     comms = find_communities(G, seed)
     score_by_acct = scored_txns.groupby("account_id")["txn_risk_score"].mean()
+    score_max_by_acct = scored_txns.groupby("account_id")["txn_risk_score"].max()
     rings: list[dict] = []
-    for i, members in enumerate(sorted(comms, key=len, reverse=True)):
+    kept = 0
+    for members in sorted(comms, key=len, reverse=True):
         members = sorted(members)
         sub = transactions[transactions["account_id"].isin(members)]
-        shared_dev = sub.groupby("device_id")["account_id"].nunique()
-        shared_dev = shared_dev[shared_dev >= 2].index.tolist()
-        shared_ip = sub.groupby("ip_address")["account_id"].nunique()
-        shared_ip = shared_ip[shared_ip >= 2].index.tolist()
+        dev_counts = sub.groupby("device_id")["account_id"].nunique()
+        shared_dev = dev_counts[dev_counts >= 2].index.tolist()
+        ip_counts = sub.groupby("ip_address")["account_id"].nunique()
+        shared_ip = ip_counts[ip_counts >= 2].index.tolist()
         dests = sub[sub["dest_account_id"].notna() & (sub["dest_account_id"] != "")]
-        shared_dst = dests.groupby("dest_account_id")["account_id"].nunique()
-        shared_dst = shared_dst[shared_dst >= 2].index.tolist()
+        dst_counts = dests.groupby("dest_account_id")["account_id"].nunique()
+        shared_dst = dst_counts[dst_counts >= 2].index.tolist()
+        biggest = max([int(dev_counts.max()) if len(dev_counts) else 0,
+                       int(ip_counts.max()) if len(ip_counts) else 0,
+                       int(dst_counts.max()) if len(dst_counts) else 0])
         links = []
         if shared_dev:
             links.append("shared_device")
@@ -109,16 +172,43 @@ def detect_rings(scored_txns: pd.DataFrame, features: pd.DataFrame,
         seq_sim = round(1.0 - len(seqs) / max(len(members), 1), 3)
         if seq_sim >= 0.5:
             links.append("purchase_sequence")
+        # Same-order rare-item buying: what fraction of member pairs share it?
+        all_pairs = [frozenset(p) for p in
+                     itertools.combinations(members, 2)]
+        io_frac = (sum(1 for p in all_pairs if p in io_pairs)
+                   / max(len(all_pairs), 1))
+        if io_frac >= 0.5 and "purchase_sequence" not in links:
+            links.append("purchase_sequence")
+        avg_score = float(score_by_acct.reindex(members).fillna(0).mean())
+        max_fanin = int(dst_counts[dst_counts >= 2].max()) if shared_dst else 0
+        # Minimum-evidence filter: one weak link type alone (e.g. a single
+        # shared IP) is not a ring. Exceptions: a high fan-in collector
+        # destination (>= min_ring_fanin senders) is a classic money-mule
+        # signal on its own, and high behavioral scores corroborate the link.
+        single_dest_case = (links == ["shared_destination"]
+                            and max_fanin >= min_fanin)
+        if len(links) < 2 and not single_dest_case and avg_score < 65:
+            continue
+        # Evidence-based score: link diversity + sequence similarity + the
+        # biggest shared-entity group. Size alone must NOT inflate risk.
+        # Take the max with the members' worst transaction score: a ring
+        # containing behaviorally hot transactions is hot even when its
+        # average is diluted by legitimate background traffic. (The
+        # minimum-evidence filter above already keeps this from inflating
+        # weak groups.)
+        evidence_score = (35 + 15 * len(links) + 10 * seq_sim
+                          + min(10, biggest))
+        member_max = float(score_max_by_acct.reindex(members).fillna(0).max())
+        ring_score = round(min(99.0, max(evidence_score, member_max)), 1)
         try:
             span = (f"{pd.to_datetime(sub['timestamp']).min().date()} to "
                     f"{pd.to_datetime(sub['timestamp']).max().date()}")
         except Exception:
             span = "unknown"
         window = f"clustered account activity window ({span})"
-        avg_score = float(score_by_acct.reindex(members).fillna(0).mean())
-        ring_score = round(min(99.0, avg_score + 5 * len(members)), 1)
+        kept += 1
         rings.append({
-            "ring_id": f"ring_{i + 1}",
+            "ring_id": f"ring_{kept}",
             "accounts": members, "size": len(members),
             "ring_risk_score": ring_score,
             "link_types_found": links or ["shared_device"],
@@ -127,6 +217,7 @@ def detect_rings(scored_txns: pd.DataFrame, features: pd.DataFrame,
                 "shared_ips": [str(x) for x in shared_ip[:10]],
                 "shared_destinations": [str(d) for d in shared_dst[:10]],
                 "purchase_sequence_similarity": seq_sim,
+                "max_destination_fanin": max_fanin,
                 "account_open_window": window,
             },
             "pattern_summary": (f"{len(members)} accounts linked by "

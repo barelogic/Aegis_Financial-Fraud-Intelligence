@@ -235,8 +235,13 @@ def apply_ring_bump_to_transactions(scored_txns: pd.DataFrame,
                                     config: dict) -> pd.DataFrame:
     """Uplift transaction scores for ring members (called after detect_rings)."""
     bump = float(config.get("account_scoring", {}).get("ring_txn_bump", 10))
+    gate = float(config.get("risk_thresholds", {}).get("high", 65))
     member_to_ring: dict[str, str] = {}
     for r in rings:
+        # Gate on ring risk, same as the account bump: low-evidence groups
+        # must not inflate innocent transactions.
+        if float(r.get("ring_risk_score", 0)) < gate:
+            continue
         for a in r.get("accounts", []):
             member_to_ring[a] = r["ring_id"]
     out = scored_txns.copy()

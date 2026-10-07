@@ -66,4 +66,8 @@ link_weights:
   shared_merchant: 0.5
   purchase_sequence: 0.8
 
+# A lone shared destination counts as ring evidence only with >= this fan-in
+# (distinct sender accounts). Collector accounts are the classic mule signal.
+min_ring_fanin: 4
+
 sample_rows: 2000
