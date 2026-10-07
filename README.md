@@ -4,7 +4,7 @@ Batch + real-time fraud detection over synthetic transaction streams, with
 explainable risk scores (0–100), account-level rollups, mule-ring graph
 detection, a replayable live API, and a React risk-ops dashboard.
 
-Built as a 7-hour hackathon project. Laptop-only, no GPU, no paid APIs,
+Built as a 7-hour hackathon project. No GPU, no paid APIs,
 no internet required at runtime (frontend deps are vendored via
 `frontend/package-lock.json`; Python deps install from `requirements.txt`).
 
