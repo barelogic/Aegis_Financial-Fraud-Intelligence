@@ -1,8 +1,90 @@
 # Real-Time Financial Fraud Intelligence
 
-7-hour hackathon project. Laptop-only, no GPU, no paid APIs, no internet at runtime.
+Batch + real-time fraud detection over synthetic transaction streams, with
+explainable risk scores (0–100), account-level rollups, mule-ring graph
+detection, a replayable live API, and a React risk-ops dashboard.
 
-## Quickstart
+Built as a 7-hour hackathon project. Laptop-only, no GPU, no paid APIs,
+no internet required at runtime (frontend deps are vendored via
+`frontend/package-lock.json`; Python deps install from `requirements.txt`).
+
+Repository: https://github.com/barelogic/Financial-fraud-Intelligent-Checker
+— public, contains the complete source code. Clone it and follow
+**Setup** + **How to run** below; no other steps or private submodules
+are needed.
+
+## What it does
+
+- **Synthetic data generator** (`src/generate_data.py`): accounts,
+  transactions, and ground-truth labels, including an intentionally
+  stealthy fraud ring (Ring A) whose single transactions look ordinary.
+- **Causal feature engine** (`src/features.py`): behavior-relative
+  features computed strictly from data *before* each transaction's
+  timestamp (no look-ahead).
+- **Transaction scoring** (`src/score_transactions.py`):
+  IsolationForest + XGBoost blend (0–100) with a suppression rule for
+  legit high-value spend and SHAP/rule plain-English reasons.
+- **Account scoring** (`src/score_accounts.py`): blend of max txn score
+  + top-3 mean, plus a ring bump.
+- **Ring detection** (`src/detect_rings.py`): shared-device/IP/
+  destination/merchant graph + community detection; ring risk is pushed
+  back onto member accounts/transactions.
+- **Actions + report + evaluation** (`src/actions.py`, `src/report.py`,
+  `src/evaluate.py`): recommended action per flagged item,
+  `data/outputs/report.md`, `data/outputs/metrics.json`.
+- **Replay server** (`src/serve.py`, stdlib `http.server` + pandas):
+  deterministic `(timestamp, txn_id)` replay with SSE streaming,
+  case/entity/evaluation APIs.
+- **Live scoring** (`src/live.py`): scores arrivals as they come in with
+  the identical models, causal features, suppression rule, bands, and
+  reason builders — no batch rerun.
+- **React + TypeScript UI** (`frontend/`, Vite): event feed, transfer
+  graph, case queue, detail panel, evaluation panel, live-ingest form,
+  ring-refresh button. Legacy vanilla page (`ui/`) kept as offline
+  fallback.
+
+## Prerequisites
+
+- Python 3.10+ (tested on 3.10–3.14, CPU only)
+- Node 18+ and npm (only for the React UI; backend works without it)
+- `pip`, `venv` (standard library), `git`
+- ~500 MB free for `.venv/` + `frontend/node_modules/` + generated CSVs
+
+## Setup
+
+```bash
+git clone https://github.com/barelogic/Financial-fraud-Intelligent-Checker.git
+cd Financial-fraud-Intelligent-Checker
+
+# 1. Python environment
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+
+# 2. Frontend deps (skip if you only want backend + legacy ui/)
+cd frontend && npm ci && cd ..
+
+# 3. Generate + score data (fast sample: 2,000 rows)
+python run_all.py --sample
+# full run:
+# python run_all.py
+```
+
+What `run_all.py` accepts:
+
+```bash
+python run_all.py --sample        # fast test on 2,000 rows
+python run_all.py                 # full run
+python run_all.py --skip-generate # reuse existing data/raw
+python run_all.py --seed 123
+python run_all.py --force         # accept data/raw drift vs manifest.json
+```
+
+Sample `data/raw/*.csv` is committed so evaluators can run without
+regenerating. Fresh runs write `data/outputs/` (`transactions_scored.csv`,
+`accounts_scored.csv`, `rings.json`, `metrics.json`, `report.md`, `manifest.json`).
+
+## How to run the solution
 
 One command runs everything (deps → sample data → backend → React UI):
 
@@ -14,39 +96,21 @@ python run.py --backend-only  # skip the frontend (needs no Node)
 python run.py --help          # --full, --port, --skip-pipeline, --skip-install, ...
 ```
 
-Manual steps (what `run.py` automates):
+Then open:
+
+- React UI: http://127.0.0.1:5173/ (dev) or http://127.0.0.1:8000/ (`--build`)
+- Backend health: http://127.0.0.1:8000/v1/health
+- Legacy fallback UI: http://127.0.0.1:8000/legacy
+
+Manual equivalent (what `run.py` automates):
 
 ```bash
-pip install -r requirements.txt
-python run_all.py --sample        # fast test on 2,000 rows
-python run_all.py                 # full run
-python run_all.py --skip-generate # reuse existing data/raw
-python run_all.py --seed 123
-python run_all.py --force         # accept data/raw drift vs manifest.json
-```
-
-## Provenance (Phase 0)
-
-Every run writes `data/outputs/manifest.json`: seed, config hash, per-file
-sha256/size/row counts for `data/raw/*.csv`, data time range, label counts,
-and git sha. If raw inputs drift from the manifest (e.g. hand-edited CSVs),
-scoring refuses with exit 2 unless the data was freshly generated or
-`--force` is passed. `metrics.json` also freezes its evaluation inputs
-(`train_cutoff`, `calibration_window`, `threshold`).
-
-## Live replay + UI
-
-Read-only server over the batch outputs (stdlib `http.server` + pandas).
-The UI is now **React + TypeScript** (`frontend/`, Vite build). The legacy
-vanilla page (`ui/`) is kept as an offline fallback:
-
-```bash
+# backend over batch outputs
 .venv/bin/python -m src.serve --outputs data/outputs --port 8000
 # open http://127.0.0.1:8000/          -> frontend/dist/ when built, else ui/
 # open http://127.0.0.1:8000/legacy    -> legacy vanilla UI always
-```
 
-```bash
+# frontend dev server
 cd frontend
 npm install
 npm run dev     # http://127.0.0.1:5173, /v1 proxied to 127.0.0.1:8000
@@ -93,6 +157,26 @@ returns `400 live mode is off`. `/v1/*` sends
 `Access-Control-Allow-Origin: *` so `npm run dev` (port 5173) can call the
 backend (port 8000) cross-origin.
 
+## Tests
+
+```bash
+.venv/bin/python -m pytest -q
+```
+
+Covers generation, temporal causality (no look-ahead), score bands,
+live/batch parity (`tests/test_live.py`), the HTTP API
+(`tests/test_serve.py`), and an end-to-end smoke run
+(`tests/test_smoke.py`).
+
+## Provenance
+
+Every run writes `data/outputs/manifest.json`: seed, config hash, per-file
+sha256/size/row counts for `data/raw/*.csv`, data time range, label counts,
+and git sha. If raw inputs drift from the manifest (e.g. hand-edited CSVs),
+scoring refuses with exit 2 unless the data was freshly generated or
+`--force` is passed. `metrics.json` also freezes its evaluation inputs
+(`train_cutoff`, `calibration_window`, `threshold`).
+
 ## Pipeline
 
 `run_all.py` runs, in order:
@@ -122,6 +206,20 @@ backend (port 8000) cross-origin.
 - `config.yaml:column_mapping` maps logical schema names to dataset columns
   so a different dataset can be plugged in without code changes.
 
-## Layout
+## Project layout
 
-See repo tree. Outputs land in `data/outputs/` with the fixed schemas.
+```text
+run.py                  one-command runner (backend + frontend)
+run_all.py              batch pipeline driver
+config.yaml             thresholds, blend weights, column mapping
+requirements.txt        Python deps
+src/                    generate_data, features, scoring, rings, live, serve
+frontend/               React + TypeScript UI (Vite)
+  src/api.ts, types.ts, hooks/useFraudIntel.ts, components/, App.tsx
+ui/                     legacy vanilla fallback UI (offline)
+lib/                    vendored vis-network / tom-select for offline ui/
+synthgen/               synthetic-data helper notes
+tests/                  pytest suite
+data/raw/               committed sample input CSVs
+data/outputs/           generated on run (gitignored except .gitkeep)
+```

@@ -62,10 +62,12 @@ export function useFraudIntel(): FraudIntelState {
       const h = await getHealth();
       setHealth(h);
       setError(null);
-      const { events: evts } = await getEvents(
-        Math.max(0, h.n_events - 50),
-        50,
-      );
+      // Feed follows the replay cursor so rows visibly stream during
+      // playback. Cursor 0 (fresh/reset/paused-at-start) shows the tail,
+      // where the fraud clusters; otherwise show the 50 rows ending at
+      // the cursor.
+      const end = h.cursor > 0 ? Math.min(h.cursor, h.n_events) : h.n_events;
+      const { events: evts } = await getEvents(Math.max(0, end - 50), 50);
       setEvents(evts);
       const { cases: cs } = await getCases();
       setCases(cs);
