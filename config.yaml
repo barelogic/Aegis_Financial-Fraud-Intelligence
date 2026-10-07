@@ -1,0 +1,69 @@
+seed: 42
+
+# Maps logical schema names (used in code) -> actual column names in the dataset.
+# Default is identity mapping; change values to plug in a different dataset.
+column_mapping:
+  txn_id: txn_id
+  timestamp: timestamp
+  account_id: account_id
+  amount: amount
+  currency: currency
+  merchant_id: merchant_id
+  merchant_category: merchant_category
+  item_id: item_id
+  item_category: item_category
+  channel: channel
+  device_id: device_id
+  ip_address: ip_address
+  city: city
+  country: country
+  txn_type: txn_type
+  dest_account_id: dest_account_id
+  created_at: created_at
+  home_city: home_city
+  home_country: home_country
+  segment: segment
+
+risk_thresholds:
+  medium: 40
+  high: 65
+  critical: 85
+
+# Max share of transactions that should be flagged high/critical (for report warnings).
+alert_budget_pct: 5.0
+
+blend:
+  isolation_forest: 0.5
+  supervised: 0.5
+
+model:
+  train_window_frac: 0.6
+  n_estimators: 200
+  max_depth: 5
+  learning_rate: 0.05
+  contamination: 0.05
+  oof_splits: 3
+
+# Suppression rule: protects legit high-value transactions from false alarms.
+# Fires when amount is high BUT behavior is otherwise normal.
+suppression:
+  amount_high_inr: 50000
+  zscore_max: 2.0
+  fanin_max: 1
+  cap_score: 39  # must stay below medium threshold (40)
+
+account_scoring:
+  w_max: 0.6
+  w_top3: 0.4
+  ring_bump: 20
+  ring_txn_bump: 10
+
+# Link-type weights for ring detection (graph edge weights).
+link_weights:
+  shared_device: 1.0
+  shared_ip: 1.0
+  shared_destination: 1.5
+  shared_merchant: 0.5
+  purchase_sequence: 0.8
+
+sample_rows: 2000
