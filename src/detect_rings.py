@@ -16,7 +16,9 @@ import pandas as pd
 
 def _seq_signature(transactions: pd.DataFrame, acct: str) -> tuple:
     """Ordered merchant-category sequence for one account (baseline)."""
-    sub = transactions[transactions["account_id"] == acct].sort_values("timestamp")
+    sub = transactions[transactions["account_id"] == acct].copy()
+    sub["timestamp"] = pd.to_datetime(sub["timestamp"])
+    sub = sub.sort_values("timestamp")
     return tuple(sub["merchant_category"].tolist()[:8])
 
 
@@ -30,7 +32,9 @@ def _item_order_pairs(transactions: pd.DataFrame, min_shared: int = 2,
     the laptop buyers (1 shared item) and supplier accounts (1 shared item).
     """
     tx = transactions[transactions["item_id"].notna()
-                      & (transactions["item_id"] != "")]
+                      & (transactions["item_id"] != "")].copy()
+    # Coerce: batch CSV strings and live Timestamps must sort together.
+    tx["timestamp"] = pd.to_datetime(tx["timestamp"])
     buyers = tx.groupby("item_id")["account_id"].apply(lambda s: sorted(set(s)))
     buyers = buyers[buyers.apply(len).between(2, max_buyers)]
     if buyers.empty:

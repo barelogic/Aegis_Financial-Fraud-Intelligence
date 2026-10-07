@@ -90,6 +90,8 @@
   .case .meta { color: var(--muted); font-size: 12px; margin-top: 4px; }
   .chip { display: inline-block; font-size: 11px; background: #222b40; color: #b9c6e2;
     border-radius: 6px; padding: 1px 7px; margin: 1px 3px 1px 0; }
+  .chip.live { background: rgba(91, 140, 255, 0.16); color: #9db9ff;
+    border: 1px solid var(--accent); font-weight: 700; }
   #detail { font-size: 12.5px; }
   #detail .dhead { display: flex; align-items: center; gap: 9px; margin-bottom: 8px; flex-wrap: wrap; }
   #detail .did { font-family: var(--mono); font-weight: 700; font-size: 14px; }
@@ -133,6 +135,7 @@
         <span><i style="background:#dd4"></i>medium</span>
         <span><i style="background:#4a4"></i>low</span>
         <span><i style="background:#48c"></i>destination</span>
+        <span><i style="background:#5b8cff"></i>scored live (not replayed)</span>
       </div></section>
     <section><h3>Case queue <span class="count" id="case-count">–</span></h3><div id="cases"></div></section>
   </div>

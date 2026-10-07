@@ -39,6 +39,32 @@ API: `GET /v1/health`, `GET /v1/events?cursor=&limit=`,
 `(timestamp, txn_id)` order with decisions precomputed at startup, so
 reset → replay yields identical event IDs every time.
 
+## Real-time scoring (no batch rerun, no past logs)
+
+The batch pipeline replays history; live mode scores transactions **as
+they arrive**, with the identical models, causal features, suppression
+rule, bands, and reason builders (single source of truth — `src/live.py`
+reuses `features_for_row`/`update_state` and the batch scorers):
+
+```bash
+.venv/bin/python -m src.serve --live --port 8000   # warms up from data/raw, fits models
+# score one arrival (same schema as transactions.csv, no score columns):
+curl -X POST localhost:8000/v1/events/ingest -d '{"txn_id":"live_1",
+  "timestamp":"2025-02-01 10:00:00", "account_id":"acc_0001", "amount":42000,
+  "merchant_category":"electronics", "channel":"online", "device_id":"dev_new",
+  "city":"Delhi", "txn_type":"purchase"}'
+# -> {"ok": true, "event": {"txn_risk_score": ..., "txn_reasons": ..., ...}}
+curl -X POST localhost:8000/v1/rings/refresh   # re-run ring detection incl. live rows
+# demo: stream raw history into the live server as if it were happening now:
+.venv/bin/python src/simulate_stream.py --post http://127.0.0.1:8000 --max 50 --delay 0.2
+```
+
+Live rows append to the same ordered log with a `live: true` flag (badged
+LIVE in the UI); the cursor reveals them once caught up, and reset replays
+them in arrival order. Ring refresh recomputes over batch + live rows and
+refreshes the account view (including sink attribution). Unknown accounts
+are registered on first sight; duplicates are rejected (409).
+
 ## Pipeline
 
 `run_all.py` runs, in order:

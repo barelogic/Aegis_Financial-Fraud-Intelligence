@@ -15,6 +15,10 @@ a live-replay API:
   GET /v1/events/stream        -> SSE (heartbeat every 15s when idle)
   POST /v1/replay/control      -> {op: start|pause|reset, speed?}
 
+Live mode (`--live`): additionally --
+  POST /v1/events/ingest       -> score one raw transaction AS IT ARRIVES
+  POST /v1/rings/refresh       -> re-run ring detection over batch + live rows
+
 Replay semantics: strict (timestamp, txn_id) order; all decisions are
 precomputed at startup (streaming only reveals a prefix); duplicate txn_id
 is a startup error; reset restores cursor 0 so replays are identical;
@@ -34,6 +38,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pandas as pd
+import yaml
+
+# Sibling imports must work whether this runs as `python -m src.serve`
+# (repo root on sys.path, `src/` is NOT) or as `import serve` with `src/`
+# already on the path (tests). So anchor src/ explicitly. No new deps.
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from live import LiveRings, LiveScorer, rescore_accounts
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SPEED = 5
@@ -77,7 +90,8 @@ def _severity(score: float) -> str:
 class Store:
     """All precomputed decisions, loaded once at startup."""
 
-    def __init__(self, outputs_dir: str | Path):
+    def __init__(self, outputs_dir: str | Path, live: bool = False,
+                 config: dict | None = None):
         out = Path(outputs_dir)
         txns = pd.read_csv(out / "transactions_scored.csv",
                            parse_dates=["timestamp"])
@@ -88,6 +102,7 @@ class Store:
         self.events: list[dict] = [_row_dict(r) for _, r in txns.iterrows()]
         self.by_txn: dict[str, dict] = {e["txn_id"]: e for e in self.events}
         accs = pd.read_csv(out / "accounts_scored.csv")
+        self.batch_accounts_df = accs
         self.accounts: dict[str, dict] = {
             str(r["account_id"]): _row_dict(r) for _, r in accs.iterrows()}
         self.txns_by_account: dict[str, list[str]] = {}
@@ -107,6 +122,50 @@ class Store:
         self.cursor = 0
         self.playing = False
         self.speed = DEFAULT_SPEED
+        # -- live state (only with --live) --
+        self.live = live
+        self.live_rows: list[dict] = []
+        self.live_flushed = 0
+        self.live_rings: list[dict] | None = None
+        self.live_accounts: dict[str, dict] | None = None
+        self.scorer: LiveScorer | None = None
+        self.rings_engine: LiveRings | None = None
+        self.raw_txns_df: pd.DataFrame | None = None
+        if live:
+            if config is None:
+                with open(ROOT / "config.yaml") as f:
+                    config = yaml.safe_load(f)
+            self.config = config
+            raw_dir = out.parent / "raw"
+            # Parse datetimes: live rows carry Timestamps, so batch strings
+            # must match (mixed str/Timestamp columns crash sorts).
+            raw_txns = pd.read_csv(raw_dir / "transactions.csv",
+                                   parse_dates=["timestamp"])
+            raw_accs = pd.read_csv(raw_dir / "accounts.csv",
+                                   parse_dates=["created_at"])
+            gt_path = raw_dir / "ground_truth_txn.csv"
+            labels = pd.read_csv(gt_path) if gt_path.exists() else None
+            print("[serve] live warm-up: replaying history + fitting models ...")
+            self.scorer = LiveScorer(config).fit(raw_txns, raw_accs, labels)
+            self.rings_engine = LiveRings(config)
+            self.raw_txns_df = raw_txns
+            self.raw_accs_df = raw_accs
+            print("[serve] live ready: send raw txns to POST /v1/events/ingest")
+
+    @property
+    def log(self) -> list[dict]:
+        """Full ordered log: batch events followed by live arrivals."""
+        return self.events + self.live_rows
+
+    @property
+    def effective_rings(self) -> list[dict]:
+        return self.live_rings if self.live_rings is not None else self.rings
+
+    @property
+    def effective_accounts(self) -> dict[str, dict]:
+        if self.live_accounts is not None:
+            return self.live_accounts
+        return self.accounts
 
     # -- replay state (all under lock) --
     def snapshot(self) -> dict:
@@ -123,6 +182,7 @@ class Store:
             elif op == "reset":
                 self.playing = False
                 self.cursor = 0
+                self.live_flushed = 0
             else:
                 raise ValueError(f"unknown op: {op!r}")
             if speed is not None:
@@ -133,11 +193,77 @@ class Store:
                     "speed": self.speed}
 
     def advance(self, n: int) -> list[dict]:
-        """Pop up to n events from the cursor (SSE tick)."""
+        """Pop up to n UNFLUSHED events from the cursor (SSE tick).
+
+        Live rows revealed via drain_new_live are skipped here so no row
+        is ever delivered twice on the stream.
+        """
         with self.lock:
-            batch = self.events[self.cursor:self.cursor + n]
-            self.cursor += len(batch)
-            return batch
+            out: list[dict] = []
+            base = len(self.events)
+            i = self.cursor
+            while len(out) < n and i < base + len(self.live_rows):
+                if i < base:
+                    out.append(self.events[i])
+                else:
+                    j = i - base
+                    if j >= self.live_flushed:
+                        out.append(self.live_rows[j])
+                        self.live_flushed = j + 1
+                i += 1
+            self.cursor = i
+            return out
+
+    def drain_new_live(self) -> list[dict]:
+        """Live rows the cursor has caught up to but not yet delivered."""
+        with self.lock:
+            base = len(self.events)
+            out = []
+            while (self.live_flushed < len(self.live_rows)
+                   and base + self.live_flushed < self.cursor):
+                out.append(self.live_rows[self.live_flushed])
+                self.live_flushed += 1
+            return out
+
+    # -- live ingestion (only with --live) --
+    def ingest_live(self, raw: dict) -> dict:
+        """Score one arriving raw transaction and append it to the log."""
+        if not self.live or self.scorer is None:
+            raise ValueError("live mode is off (restart with --live)")
+        event, row = self.scorer.score_one(raw)
+        with self.lock:
+            self.live_rows.append(event)
+            self.by_txn[event["txn_id"]] = event
+            self.txns_by_account.setdefault(str(event["account_id"]),
+                                            []).append(event["txn_id"])
+            assert self.rings_engine is not None
+            self.rings_engine.add(row, event)
+        return event
+
+    def refresh_rings(self) -> list[dict]:
+        """Re-run ring detection over batch + live rows; refresh accounts."""
+        if not self.live or self.rings_engine is None:
+            raise ValueError("live mode is off (restart with --live)")
+        with self.lock:
+            batch_scored = pd.DataFrame(self.events)
+        assert self.raw_txns_df is not None
+        rings = self.rings_engine.refresh(batch_scored, self.raw_txns_df)
+        acct_df = self.rings_engine.live_accounts_frame(
+            self.scorer.store.acct_info)
+        full_accs = pd.concat([self.batch_accounts_df, acct_df],
+                              ignore_index=True)
+        full_accs = full_accs.drop_duplicates("account_id", keep="first")
+        accs = rescore_accounts(batch_scored,
+                                list(self.live_rows), full_accs, rings,
+                                self.config)
+        with self.lock:
+            self.live_rings = rings
+            self.live_accounts = {
+                str(r["account_id"]): _row_dict(r)
+                for _, r in accs.iterrows()}
+            for aid, tids in self.txns_by_account.items():
+                pass  # txns_by_account already tracks live rows on ingest
+        return rings
 
     # -- read views --
     def cases_view(self) -> list[dict]:
@@ -145,7 +271,7 @@ class Store:
         if self.cases is not None:
             return self.cases
         out = []
-        for r in self.rings:
+        for r in self.effective_rings:
             members = [str(a) for a in r.get("accounts", [])]
             tids = [t for a in members
                     for t in self.txns_by_account.get(a, [])]
@@ -166,8 +292,9 @@ class Store:
         return out
 
     def entity(self, entity_id: str) -> dict | None:
-        if entity_id in self.accounts:
-            acct = dict(self.accounts[entity_id])
+        accounts = self.effective_accounts
+        if entity_id in accounts:
+            acct = dict(accounts[entity_id])
             acct["kind"] = "account"
             acct["transactions"] = self.txns_by_account.get(entity_id, [])
             return acct
@@ -232,14 +359,18 @@ def make_server(host: str, port: int, store: Store) -> ThreadingHTTPServer:
                 elif parsed.path == "/v1/health":
                     snap = store.snapshot()
                     self._send_json({"ok": True,
-                                     "n_events": len(store.events), **snap})
+                                     "n_events": len(store.log),
+                                     "live": store.live,
+                                     "n_live": len(store.live_rows),
+                                     **snap})
                 elif parsed.path == "/v1/events":
                     cursor = int(query.get("cursor", ["0"])[0])
                     limit = min(int(query.get("limit", ["50"])[0]), 500)
-                    if cursor < 0 or cursor > len(store.events):
+                    log = store.log
+                    if cursor < 0 or cursor > len(log):
                         self._send_json({"error": "cursor out of range"}, 400)
                         return
-                    batch = store.events[cursor:cursor + limit]
+                    batch = log[cursor:cursor + limit]
                     self._send_json({"events": batch,
                                      "next_cursor": cursor + len(batch)})
                 elif parsed.path == "/v1/cases":
@@ -268,17 +399,40 @@ def make_server(host: str, port: int, store: Store) -> ThreadingHTTPServer:
 
         def do_POST(self):  # noqa: N802 (stdlib naming)
             parsed = urllib.parse.urlparse(self.path)
-            if parsed.path != "/v1/replay/control":
-                self._send_json({"error": "not found"}, 404)
+            if parsed.path == "/v1/replay/control":
+                try:
+                    length = int(self.headers.get("Content-Length", 0))
+                    payload = json.loads(self.rfile.read(length) or b"{}")
+                    state = store.control(payload.get("op", ""),
+                                          payload.get("speed"))
+                    self._send_json({"ok": True, **state})
+                except (ValueError, json.JSONDecodeError) as e:
+                    self._send_json({"error": str(e)}, 400)
                 return
-            try:
-                length = int(self.headers.get("Content-Length", 0))
-                payload = json.loads(self.rfile.read(length) or b"{}")
-                state = store.control(payload.get("op", ""),
-                                      payload.get("speed"))
-                self._send_json({"ok": True, **state})
-            except (ValueError, json.JSONDecodeError) as e:
-                self._send_json({"error": str(e)}, 400)
+            if parsed.path == "/v1/events/ingest":
+                try:
+                    length = int(self.headers.get("Content-Length", 0))
+                    raw = json.loads(self.rfile.read(length) or b"{}")
+                    if not isinstance(raw, dict):
+                        raise ValueError("ingest body must be a JSON object")
+                    event = store.ingest_live(raw)
+                    self._send_json({"ok": True, "event": event})
+                except ValueError as e:
+                    msg = str(e)
+                    status = 409 if "duplicate" in msg else 400
+                    self._send_json({"error": msg}, status)
+                except json.JSONDecodeError as e:
+                    self._send_json({"error": str(e)}, 400)
+                return
+            if parsed.path == "/v1/rings/refresh":
+                try:
+                    rings = store.refresh_rings()
+                    self._send_json({"ok": True, "n_rings": len(rings),
+                                     "rings": rings})
+                except ValueError as e:
+                    self._send_json({"error": str(e)}, 400)
+                return
+            self._send_json({"error": "not found"}, 404)
 
         def _sse_stream(self) -> None:
             self.send_response(200)
@@ -290,6 +444,12 @@ def make_server(host: str, port: int, store: Store) -> ThreadingHTTPServer:
             try:
                 while True:
                     snap = store.snapshot()
+                    # Live arrivals the cursor has caught up to go out first.
+                    for e in store.drain_new_live():
+                        self.wfile.write(
+                            f"data: {json.dumps(e)}\n\n".encode())
+                        self.wfile.flush()
+                        last_send = time.monotonic()
                     if snap["playing"]:
                         batch = store.advance(snap["speed"])
                         for e in batch:
@@ -316,8 +476,11 @@ def main() -> None:
     parser.add_argument("--outputs", default=str(ROOT / "data" / "outputs"))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--live", action="store_true",
+                        help="enable live scoring: warm up from data/raw, fit "
+                             "models, accept POST /v1/events/ingest")
     args = parser.parse_args()
-    store = Store(args.outputs)
+    store = Store(args.outputs, live=args.live)
     server = make_server(args.host, args.port, store)
     print(f"[serve] {len(store.events)} events, "
           f"{len(store.cases_view())} cases -> "

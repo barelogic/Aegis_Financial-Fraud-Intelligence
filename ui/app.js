@@ -56,9 +56,10 @@ async function control(op) {
 
 function txnRow(e) {
   const band = bandOf(e);
+  const live = e.live ? `<span class="chip live">LIVE</span>` : "";
   return `<tr data-txn="${esc(e.txn_id)}">` +
     `<td class="mono">${esc((e.timestamp || "").slice(0, 16).replace("T", " "))}</td>` +
-    `<td class="mono">${esc(e.txn_id)}</td><td class="mono">${esc(e.account_id)}</td>` +
+    `<td class="mono">${esc(e.txn_id)} ${live}</td><td class="mono">${esc(e.account_id)}</td>` +
     `<td>${esc(fmtAmt(e))}</td>` +
     `<td class="mono">${esc(e.txn_risk_score)}${scoreBar(e.txn_risk_score, band)}</td>` +
     `<td>${pill(e.txn_risk_band || "?")}</td></tr>`;
