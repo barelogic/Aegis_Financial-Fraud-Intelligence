@@ -7,4 +7,6 @@ venv/
 data/outputs/*
 !data/outputs/.gitkeep
 improvements.md
+frontend/node_modules/
+frontend/dist/
 

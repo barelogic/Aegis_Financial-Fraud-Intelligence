@@ -3,8 +3,10 @@
 Python stdlib (`http.server`) + pandas only. Serves the batch outputs with
 a live-replay API:
 
-  GET /                        -> ui/index.html
-  GET /app.js                  -> ui/app.js
+  GET /                        -> frontend/dist/index.html (React build) or
+                                  ui/index.html legacy fallback
+  GET /assets/...              -> frontend/dist/assets/... (Vite build)
+  GET /app.js                  -> ui/app.js (legacy, kept for tests/offline)
   GET /lib/...                 -> vendored assets (vis-network, offline-safe)
   GET /v1/health               -> {ok, n_events, cursor, playing, speed}
   GET /v1/events?cursor=&limit -> {events, next_cursor} in time order
@@ -23,6 +25,9 @@ Replay semantics: strict (timestamp, txn_id) order; all decisions are
 precomputed at startup (streaming only reveals a prefix); duplicate txn_id
 is a startup error; reset restores cursor 0 so replays are identical;
 pause freezes the cursor (in-flight SSE write finishes first).
+
+/v1/* responses carry `Access-Control-Allow-Origin: *` so the React
+Vite dev server (http://127.0.0.1:5173) can call the backend directly.
 
 Usage:
     python -m src.serve --outputs data/outputs --port 8000
@@ -309,6 +314,8 @@ def make_server(host: str, port: int, store: Store) -> ThreadingHTTPServer:
     """Build (but do not start) the HTTP server. Port 0 picks a free port."""
     ui_dir = ROOT / "ui"
     lib_dir = ROOT / "lib"
+    dist_dir = ROOT / "frontend" / "dist"
+    dist_index = dist_dir / "index.html"
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "FraudIntel/1"
@@ -316,15 +323,25 @@ def make_server(host: str, port: int, store: Store) -> ThreadingHTTPServer:
         def log_message(self, fmt, *args):  # quieter logs
             print(f"[serve] {self.address_string()} {fmt % args}")
 
+        def _cors(self) -> None:
+            # Vite dev server (5173) calls the backend (8000) cross-origin.
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods",
+                             "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers",
+                             "Content-Type")
+
         def _send_json(self, obj, status: int = 200) -> None:
             body = json.dumps(obj).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            self._cors()
             self.end_headers()
             self.wfile.write(body)
 
-        def _send_file(self, path: Path, ctype: str) -> None:
+        def _send_file(self, path: Path, ctype: str,
+                       max_age: int = 0) -> None:
             try:
                 body = path.read_bytes()
             except FileNotFoundError:
@@ -333,8 +350,26 @@ def make_server(host: str, port: int, store: Store) -> ThreadingHTTPServer:
             self.send_response(200)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
+            if max_age:
+                self.send_header("Cache-Control",
+                                 f"public, max-age={max_age}")
             self.end_headers()
             self.wfile.write(body)
+
+        def _send_index(self) -> None:
+            # Prefer the React build; fall back to the legacy vanilla UI
+            # so offline use and old bookmarks keep working when dist/
+            # has not been built yet.
+            if dist_index.exists():
+                self._send_file(dist_index, "text/html")
+            else:
+                self._send_file(ui_dir / "index.html", "text/html")
+
+        def do_OPTIONS(self):  # noqa: N802 (stdlib naming)
+            self.send_response(204)
+            self._cors()
+            self.send_header("Content-Length", "0")
+            self.end_headers()
 
         def do_GET(self):  # noqa: N802 (stdlib naming)
             parsed = urllib.parse.urlparse(self.path)
@@ -342,10 +377,22 @@ def make_server(host: str, port: int, store: Store) -> ThreadingHTTPServer:
             query = urllib.parse.parse_qs(parsed.query)
             try:
                 if parsed.path in ("/", "/index.html"):
+                    self._send_index()
+                elif parsed.path == "/legacy":
                     self._send_file(ui_dir / "index.html", "text/html")
                 elif parsed.path == "/app.js":
                     self._send_file(ui_dir / "app.js",
                                     "application/javascript")
+                elif parts[0] == "assets" and dist_index.exists():
+                    safe = (dist_dir / "/".join(parts)).resolve()
+                    if not str(safe).startswith(str(dist_dir.resolve())):
+                        self._send_json({"error": "forbidden"}, 403)
+                        return
+                    ctype = ("application/javascript"
+                             if safe.suffix == ".js"
+                             else "text/css" if safe.suffix == ".css"
+                             else "application/octet-stream")
+                    self._send_file(safe, ctype, max_age=31536000)
                 elif parts[0] == "lib":
                     safe = (lib_dir / "/".join(parts[1:])).resolve()
                     if not str(safe).startswith(str(lib_dir.resolve())):
@@ -392,6 +439,22 @@ def make_server(host: str, port: int, store: Store) -> ThreadingHTTPServer:
                     self._send_json(store.metrics)
                 elif parsed.path == "/v1/events/stream":
                     self._sse_stream()
+                elif dist_index.exists() and "." in parts[-1]:
+                    # Any other dotted path (vite.svg, favicon, …) resolves
+                    # inside frontend/dist when the React build exists.
+                    safe = (dist_dir / parsed.path.lstrip("/")).resolve()
+                    if (str(safe).startswith(str(dist_dir.resolve()))
+                            and safe.is_file()):
+                        ctype = ("application/javascript"
+                                 if safe.suffix == ".js"
+                                 else "text/css" if safe.suffix == ".css"
+                                 else "image/svg+xml"
+                                 if safe.suffix == ".svg"
+                                 else "text/html" if safe.suffix == ".html"
+                                 else "application/octet-stream")
+                        self._send_file(safe, ctype)
+                        return
+                    self._send_json({"error": "not found"}, 404)
                 else:
                     self._send_json({"error": "not found"}, 404)
             except (ValueError, KeyError) as e:
@@ -439,6 +502,7 @@ def make_server(host: str, port: int, store: Store) -> ThreadingHTTPServer:
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "keep-alive")
+            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             last_send = time.monotonic()
             try:

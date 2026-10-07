@@ -4,6 +4,18 @@
 
 ## Quickstart
 
+One command runs everything (deps → sample data → backend → React UI):
+
+```bash
+python run.py                 # backend :8000 + frontend :5173, opens browser
+python run.py --live          # also enable live scoring (/ingest, /rings/refresh)
+python run.py --build         # prod: build dist/, backend serves it, no vite server
+python run.py --backend-only  # skip the frontend (needs no Node)
+python run.py --help          # --full, --port, --skip-pipeline, --skip-install, ...
+```
+
+Manual steps (what `run.py` automates):
+
 ```bash
 pip install -r requirements.txt
 python run_all.py --sample        # fast test on 2,000 rows
@@ -22,14 +34,23 @@ scoring refuses with exit 2 unless the data was freshly generated or
 `--force` is passed. `metrics.json` also freezes its evaluation inputs
 (`train_cutoff`, `calibration_window`, `threshold`).
 
-## Live replay + UI (Phase 1)
+## Live replay + UI
 
-Read-only server over the batch outputs (stdlib `http.server` + pandas,
-no Node, works offline via vendored `lib/`):
+Read-only server over the batch outputs (stdlib `http.server` + pandas).
+The UI is now **React + TypeScript** (`frontend/`, Vite build). The legacy
+vanilla page (`ui/`) is kept as an offline fallback:
 
 ```bash
 .venv/bin/python -m src.serve --outputs data/outputs --port 8000
-# open http://127.0.0.1:8000/
+# open http://127.0.0.1:8000/          -> frontend/dist/ when built, else ui/
+# open http://127.0.0.1:8000/legacy    -> legacy vanilla UI always
+```
+
+```bash
+cd frontend
+npm install
+npm run dev     # http://127.0.0.1:5173, /v1 proxied to 127.0.0.1:8000
+npm run build   # emits frontend/dist/, served by src/serve.py at /
 ```
 
 API: `GET /v1/health`, `GET /v1/events?cursor=&limit=`,
@@ -64,6 +85,13 @@ LIVE in the UI); the cursor reveals them once caught up, and reset replays
 them in arrival order. Ring refresh recomputes over batch + live rows and
 refreshes the account view (including sink attribution). Unknown accounts
 are registered on first sight; duplicates are rejected (409).
+
+The React UI exposes both live endpoints directly: a **Live ingest** form
+(`POST /v1/events/ingest`) and a **⟳ Rings** button
+(`POST /v1/rings/refresh`). Both need `--live`; otherwise the server
+returns `400 live mode is off`. `/v1/*` sends
+`Access-Control-Allow-Origin: *` so `npm run dev` (port 5173) can call the
+backend (port 8000) cross-origin.
 
 ## Pipeline
 
