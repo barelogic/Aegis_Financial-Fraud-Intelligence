@@ -81,6 +81,8 @@ def main() -> None:
     parser.add_argument("--skip-generate", action="store_true")
     parser.add_argument("--sample", action="store_true",
                         help="run on 2000 rows for fast testing")
+    parser.add_argument("--force", action="store_true",
+                        help="accept data/raw drift vs manifest.json")
     args = parser.parse_args()
 
     cfg = load_config(args.seed)
@@ -103,6 +105,15 @@ def main() -> None:
     if args.sample:
         txns = maybe_sample(txns, int(cfg.get("sample_rows", 2000)), seed)
     feats = compute_features(txns, accounts, cfg)
+
+    # Phase 0 provenance gate: refuse to score drifted inputs.
+    from provenance import check_manifest
+    ok, msg = check_manifest(str(RAW), OUT / "manifest.json", cfg,
+                             force=args.force,
+                             just_generated=not args.skip_generate)
+    print(msg)
+    if not ok:
+        sys.exit(2)
 
     # 3. score_transactions (includes SHAP + rule explanations)
     from score_transactions import score_transactions

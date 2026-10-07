@@ -43,5 +43,13 @@ def evaluate(scored_txns: pd.DataFrame, scored_accs: pd.DataFrame,
     alert_pct = 100 * (scored_txns["txn_risk_score"] >= th.get("high", 65)).mean()
     metrics["alert_rate_pct"] = round(float(alert_pct), 3)
     metrics["within_budget"] = bool(alert_pct <= config.get("alert_budget_pct", 5.0))
+    # Phase 0 frozen evaluation inputs (Phase 4 fills calibration in).
+    ts = pd.to_datetime(scored_txns["timestamp"])
+    frac = float(config.get("model", {}).get("train_window_frac", 0.6))
+    cutoff = ts.min() + (ts.max() - ts.min()) * frac
+    metrics["train_cutoff"] = str(cutoff)
+    metrics["calibration_window"] = None
+    metrics["threshold"] = {"high": th.get("high", 65),
+                            "critical": th.get("critical", 85)}
     print(f"[evaluate] {metrics}")
     return metrics

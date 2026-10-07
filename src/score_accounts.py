@@ -112,7 +112,9 @@ def score_accounts(scored_txns: pd.DataFrame, features: pd.DataFrame | None,
         else pd.DataFrame())
     recv_idx = set(incoming.index) if len(incoming) else set()
     all_accts = set(accounts["account_id"].astype(str))
-    missing = all_accts - set(agg["account_id"].astype(str))
+    # sorted(): set iteration order varies across processes (hash seed),
+    # which would make output row order nondeterministic.
+    missing = sorted(all_accts - set(agg["account_id"].astype(str)))
     extra = []
     for a in missing:
         if a in recv_idx:
@@ -185,7 +187,10 @@ def apply_ring_bump(accounts_df: pd.DataFrame, rings: list[dict],
                     continue
                 votes = Counter(ring_of[s] for s in senders if s in ring_of)
                 if votes:
-                    top_ring, top_n = votes.most_common(1)[0]
+                    # Deterministic tie-break (most_common follows Counter
+                    # insertion order, which inherits set iteration order).
+                    top_ring, top_n = sorted(votes.items(),
+                                            key=lambda kv: (-kv[1], kv[0]))[0]
                     if top_n >= 3 and top_ring in by_id:
                         member_to_ring[str(dest)] = by_id[top_ring]
                         attributed.add(str(dest))

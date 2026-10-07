@@ -102,7 +102,9 @@ def build_link_graph(scored_txns: pd.DataFrame, transactions: pd.DataFrame,
     # bought >=2 uncommon items in the same chronological order.
     if item_order_pairs is None:
         item_order_pairs = _item_order_pairs(transactions)
-    for pair in item_order_pairs:
+    # sorted(): set iteration order varies across processes (hash seed);
+    # edge insertion order must be deterministic for byte-identical outputs.
+    for pair in sorted(item_order_pairs, key=lambda p: sorted(tuple(p))):
         u, v = sorted(tuple(pair))
         if G.has_node(u) and G.has_node(v):
             prev = G[u][v]["weight"] if G.has_edge(u, v) else 0.0

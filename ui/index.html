@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fraud Intel — Live Replay</title>
+<link rel="stylesheet" href="/lib/vis-9.1.2/vis-network.css">
+<style>
+  body { font-family: sans-serif; margin: 0; background: #111; color: #ddd; }
+  header { padding: 10px 16px; background: #1c1c1c; display: flex; gap: 12px; align-items: center; }
+  header button, header select { padding: 6px 10px; }
+  #status { margin-left: auto; font-size: 13px; color: #9d9; }
+  main { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding: 10px; }
+  section { background: #1c1c1c; padding: 10px; border-radius: 6px; min-height: 200px; }
+  #graph { height: 420px; background: #0a0a0a; }
+  table { width: 100%; font-size: 12px; border-collapse: collapse; }
+  td, th { border-bottom: 1px solid #333; padding: 3px 6px; text-align: left; }
+  tr.critical { color: #f66; } tr.high { color: #fa4; } tr.medium { color: #dd6; }
+  #detail { white-space: pre-wrap; font-size: 12px; }
+  .case { cursor: pointer; padding: 4px; border-bottom: 1px solid #333; }
+  .case:hover { background: #2a2a2a; }
+</style>
+</head>
+<body>
+<header>
+  <strong>Fraud Intel</strong>
+  <button id="btn-start">Start</button>
+  <button id="btn-pause">Pause</button>
+  <button id="btn-reset">Reset</button>
+  <label>Speed <select id="sel-speed"><option>1</option><option selected>5</option><option>20</option></select></label>
+  <label><input type="checkbox" id="chk-all"> all events in graph (default: transfers only)</label>
+  <span id="status">connecting…</span>
+</header>
+<main>
+  <section><h3>Event feed (latest 50)</h3><table id="feed"><tr><th>time</th><th>txn</th><th>acct</th><th>amt</th><th>score</th><th>action</th></tr></table></section>
+  <section><h3>Transfer graph (latest 40)</h3><div id="graph"></div></section>
+  <section><h3>Case queue</h3><div id="cases"></div></section>
+  <section><h3>Detail</h3><div id="detail">click a row, node, or case…</div></section>
+</main>
+<script src="/lib/vis-9.1.2/vis-network.min.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

@@ -6,4 +6,3 @@ venv/
 .pytest_cache/
 data/outputs/*
 !data/outputs/.gitkeep
-improvements.md
